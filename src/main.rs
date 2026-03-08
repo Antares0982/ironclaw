@@ -1056,24 +1056,28 @@ async fn setup_wasm_channels(
             tracing::info!(channel = %channel_name, "Registered HMAC signing secret");
         }
 
-        if let Some(secrets) = secrets_store {
-            match inject_channel_credentials(&channel_arc, secrets.as_ref(), &channel_name).await {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(
-                            channel = %channel_name,
-                            credentials_injected = count,
-                            "Channel credentials injected"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
+        match inject_channel_credentials(
+            &channel_arc,
+            secrets_store.as_ref().map(|s| s.as_ref()),
+            &channel_name,
+        )
+        .await
+        {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!(
                         channel = %channel_name,
-                        error = %e,
-                        "Failed to inject channel credentials"
+                        credentials_injected = count,
+                        "Channel credentials injected"
                     );
                 }
+            }
+            Err(e) => {
+                tracing::error!(
+                    channel = %channel_name,
+                    error = %e,
+                    "Failed to inject channel credentials"
+                );
             }
         }
 
@@ -1135,49 +1139,82 @@ fn check_onboard_needed() -> Option<&'static str> {
 ///
 /// Looks for secrets matching the pattern `{channel_name}_*` and injects them
 /// as credential placeholders (e.g., `telegram_bot_token` -> `{TELEGRAM_BOT_TOKEN}`).
+///
+/// Falls back to environment variables with the uppercase name if not found
+/// in the secrets store (e.g., `TELEGRAM_BOT_TOKEN`).
 async fn inject_channel_credentials(
     channel: &Arc<ironclaw::channels::wasm::WasmChannel>,
-    secrets: &dyn SecretsStore,
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
     channel_name: &str,
 ) -> anyhow::Result<usize> {
-    let all_secrets = secrets
-        .list("default")
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to list secrets: {}", e))?;
-
-    let prefix = format!("{}_", channel_name);
     let mut count = 0;
+    let mut injected_placeholders = std::collections::HashSet::new();
 
-    for secret_meta in all_secrets {
-        if !secret_meta.name.starts_with(&prefix) {
-            continue;
-        }
+    // Phase 1: inject from secrets store (if available)
+    if let Some(secrets) = secrets {
+        let all_secrets = secrets
+            .list("default")
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list secrets: {}", e))?;
 
-        let decrypted = match secrets.get_decrypted("default", &secret_meta.name).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    secret = %secret_meta.name,
-                    error = %e,
-                    "Failed to decrypt secret for channel credential injection"
-                );
+        let prefix = format!("{}_", channel_name);
+
+        for secret_meta in all_secrets {
+            if !secret_meta.name.starts_with(&prefix) {
                 continue;
             }
-        };
 
-        let placeholder = secret_meta.name.to_uppercase();
+            let decrypted = match secrets.get_decrypted("default", &secret_meta.name).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        secret = %secret_meta.name,
+                        error = %e,
+                        "Failed to decrypt secret for channel credential injection"
+                    );
+                    continue;
+                }
+            };
 
-        tracing::debug!(
-            channel = %channel_name,
-            secret = %secret_meta.name,
-            placeholder = %placeholder,
-            "Injecting credential"
-        );
+            let placeholder = secret_meta.name.to_uppercase();
 
-        channel
-            .set_credential(&placeholder, decrypted.expose().to_string())
-            .await;
-        count += 1;
+            tracing::debug!(
+                channel = %channel_name,
+                secret = %secret_meta.name,
+                placeholder = %placeholder,
+                "Injecting credential from secrets store"
+            );
+
+            channel
+                .set_credential(&placeholder, decrypted.expose().to_string())
+                .await;
+            injected_placeholders.insert(placeholder);
+            count += 1;
+        }
+    }
+
+    // Phase 2: fall back to environment variables for credentials not yet injected.
+    // This allows channels to work when configured via env vars (e.g., TELEGRAM_BOT_TOKEN)
+    // without requiring the secrets store / setup wizard to have run.
+    let caps = channel.capabilities();
+    if let Some(ref http_cap) = caps.tool_capabilities.http {
+        for cred_mapping in http_cap.credentials.values() {
+            let placeholder = cred_mapping.secret_name.to_uppercase();
+            if injected_placeholders.contains(&placeholder) {
+                continue;
+            }
+            if let Ok(env_value) = std::env::var(&placeholder) {
+                if !env_value.is_empty() {
+                    tracing::debug!(
+                        channel = %channel_name,
+                        placeholder = %placeholder,
+                        "Injecting credential from environment variable"
+                    );
+                    channel.set_credential(&placeholder, env_value).await;
+                    count += 1;
+                }
+            }
+        }
     }
 
     Ok(count)

@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug ironclaw",
+      "program": "${workspaceFolder}/target/debug/ironclaw",
+      "args": ["run"],
+      "env": {
+        "RUST_LOG": "ironclaw=debug",
+        "RUST_BACKTRACE": "1"
+      },
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug ironclaw (trace)",
+      "program": "${workspaceFolder}/target/debug/ironclaw",
+      "args": ["run"],
+      "env": {
+        "RUST_LOG": "ironclaw=trace",
+        "RUST_BACKTRACE": "1"
+      },
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
